@@ -1,14 +1,14 @@
 name: Desktop · upstream tag → installers
 
-# Upstream tag pushes never reach this repository, so the schedule is the trigger: detect reads the
-# upstream tag list and this repository's release ledger, then packages only the tags it has not
-# published yet. Everything below is idempotent — a failed run leaves the tag pending and the next
-# run retries it.
+# 上游仓库打 tag 时不会通知本仓库，所以用定时轮询代替：detect 任务拉取上游 tag 列表，
+# 与本仓库已发布的 Release 账本做差集，只打包尚未发布过的 tag。
+# 全程幂等：某次失败只会让该 tag 保持待处理状态，下次轮询自动重试。
 
 on:
   schedule:
-    # Off the hour to avoid GitHub's congestion window; scheduled runs are best-effort, not exact.
-    - cron: '13,43 * * * *'
+    # 每天 UTC 01:13（北京时间 09:13）。刻意避开整点：GitHub 的定时任务在整点前后最拥堵，
+    # 且定时触发是尽力而为，实际时间可能有延迟。
+    - cron: '13 1 * * *'
   workflow_dispatch:
     inputs:
       tag:
@@ -20,7 +20,7 @@ on:
         type: string
         default: 'win-x64'
       allow_partial:
-        description: '允许部分目标失败也发布 release（不勾选时任一目标失败都不发布）'
+        description: '允许部分目标失败也发布 Release（不勾选时任一目标失败都不发布）'
         type: boolean
         default: false
 
@@ -35,10 +35,10 @@ env:
   UPSTREAM_REPO: deepseek-ai/deepseek-harness
   UPSTREAM_TAG_PREFIX: dsh-v
   PROCESSED_TAG_PREFIX: desktop-
-  # Runtime each installer bundles; the packaged version must exist here before a tag can build.
+  # 安装包内置的运行时包名；对应版本必须已发布到 npm，该 tag 才能打包。
   NPM_RUNTIME_PACKAGE: '@deepseek-ai/dsh'
   MAX_TAGS_PER_RUN: '2'
-  # Never report to the production telemetry endpoint baked into apps/cli/cordis.yml.
+  # 不向 apps/cli/cordis.yml 里写死的生产遥测端点上报。
   DSH_TELEMETRY_DISABLED: '1'
   DSH_DESKTOP_UPDATE_CHANNEL: nightly
 
@@ -68,22 +68,23 @@ jobs:
             target="$(echo "$raw" | tr -d '[:space:]')"
             [ -n "$target" ] || continue
             case "$target" in
-              # The plain macOS labels are Intel x64 and the -arm64 labels are Apple Silicon:
-              # macos-14's image manifest lists JAVA_HOME_*_X64 and chromedriver-mac-x64.
-              # macos-13 is retired, and macos-14 is being sunset, so both targets use macOS 15.
+              # 注意 GitHub 的 macOS 标签命名：不带后缀的是 Intel x64，带 -arm64 的才是 Apple Silicon。
+              # macos-14 的镜像清单里列的是 JAVA_HOME_*_X64 与 chromedriver-mac-x64 即为证。
+              # macos-13 已下线、macos-14 已进入废弃期，所以两个目标都锚定 macOS 15。
               win-x64)   entries+=("\"win-x64\":\"windows-latest\"") ;;
               mac-arm64) entries+=("\"mac-arm64\":\"macos-15-arm64\"") ;;
               mac-x64)   entries+=("\"mac-x64\":\"macos-15\"") ;;
-              *) echo "::error::unknown target '$target' (expected win-x64, mac-arm64 or mac-x64)"; exit 1 ;;
+              *) echo "::error::未知打包目标 '$target'（应为 win-x64、mac-arm64 或 mac-x64）"; exit 1 ;;
             esac
           done
-          [ "${#entries[@]}" -gt 0 ] || { echo '::error::no targets selected'; exit 1; }
+          [ "${#entries[@]}" -gt 0 ] || { echo '::error::未选择任何打包目标'; exit 1; }
           joined="$(IFS=,; echo "${entries[*]}")"
           echo "TARGET_RUNNERS={$joined}" >> "$GITHUB_ENV"
-          echo "targets: {$joined}"
+          echo "目标与 runner: {$joined}"
 
       - name: Diff upstream tags against the release ledger
         id: detect
+        shell: bash
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           FORCE_TAG: ${{ inputs.tag }}
@@ -100,11 +101,11 @@ jobs:
         include: ${{ fromJSON(needs.detect.outputs.matrix) }}
     runs-on: ${{ matrix.runsOn }}
     timeout-minutes: 300
-    # Every run step below sets its shell explicitly, and Windows steps use pwsh rather than bash.
-    # Git Bash puts /usr/bin/tar (GNU tar) ahead of the bundled bsdtar on PATH, and GNU tar reads
-    # the "D:" in "D:\a\..." as a remote host, so tar fails with "Cannot connect to D: resolve
-    # failed" — exactly the failure this pipeline used to hit in prepare:packages. pwsh is present
-    # on both the Windows and the macOS runner images, so the shared steps use it too.
+    # 下面每个 run 步骤都显式声明 shell，Windows 步骤一律用 pwsh 而非 bash。
+    # 原因：Git Bash 会把 /usr/bin/tar（GNU tar）排到系统自带 bsdtar 前面，而 GNU tar 会把
+    # "D:\a\..." 里的 D: 当成远程主机名，导致 tar 报 "Cannot connect to D: resolve failed"。
+    # 这正是本流水线曾在 prepare:packages 阶段踩到的失败。Windows 与 macOS 的 runner 镜像都自带
+    # pwsh，所以两个平台共用的步骤也统一用它。
     steps:
       - uses: actions/checkout@v7.0.1
         with:
@@ -118,7 +119,7 @@ jobs:
         env:
           EXPECTED_TAG: ${{ matrix.tag }}
         run: |
-          node -e 'const fs=require("node:fs");const v=JSON.parse(fs.readFileSync("package.json","utf8")).version;const want=process.env.UPSTREAM_TAG_PREFIX+v;if(process.env.EXPECTED_TAG!==want){console.error("::error::upstream tag "+process.env.EXPECTED_TAG+" does not match package.json version "+v);process.exit(1)}console.log("tag "+process.env.EXPECTED_TAG+" matches package.json "+v)'
+          node -e 'const fs=require("node:fs");const v=JSON.parse(fs.readFileSync("package.json","utf8")).version;const want=process.env.UPSTREAM_TAG_PREFIX+v;if(process.env.EXPECTED_TAG!==want){console.error("::error::上游 tag "+process.env.EXPECTED_TAG+" 与 package.json 版本 "+v+" 不一致");process.exit(1)}console.log("tag "+process.env.EXPECTED_TAG+" 与 package.json 版本 "+v+" 一致")'
 
       - uses: pnpm/action-setup@v6.1.0
 
@@ -132,12 +133,11 @@ jobs:
         run: pnpm install --frozen-lockfile
 
       - name: Verify the Windows build toolchain
-        # Upstream (apps/desktop/packaging/README.zh.md) requires Node 24, pnpm, Git, PowerShell,
-        # tar, Python, Visual C++ Build Tools and the Windows SDK. Asserting them here turns a
-        # missing tool into a seconds-long failure instead of a 40-minute build that dies late.
-        # The tar check is the important one: `--check` probes tar with relative paths inside a
-        # temp directory, so it passes with GNU tar even though the real build uses absolute paths
-        # and fails there.
+        # 上游 apps/desktop/packaging/README.zh.md 要求：Node 24、根 packageManager 固定版本的
+        # pnpm、Git、PowerShell、tar、Python、Visual C++ Build Tools 与 Windows SDK。
+        # 在这里逐项断言，能让「缺工具」在几秒内失败，而不是让构建跑到 40 分钟后才崩。
+        # 其中 tar 这条最关键：上层 --check 是在临时目录里用相对路径探测 tar 的，GNU tar 也能通过；
+        # 但真实构建用绝对路径，GNU tar 在那里才会出错。
         if: matrix.target == 'win-x64'
         shell: pwsh
         run: |
@@ -147,43 +147,43 @@ jobs:
           $tarVersion = (& $tar --version | Select-Object -First 1)
           Write-Host "tar    : $tar ($tarVersion)"
           if ($tarVersion -notmatch 'bsdtar') {
-            throw "tar resolved to '$tar' ($tarVersion). Windows packaging needs the bundled bsdtar: GNU tar treats the 'D:' in an absolute path as a remote host and aborts with 'Cannot connect to D: resolve failed'."
+            throw "tar 解析到了 '$tar'（$tarVersion）。Windows 打包必须使用系统自带的 bsdtar：GNU tar 会把绝对路径里的 'D:' 当成远程主机，随后以 'Cannot connect to D: resolve failed' 中止。"
           }
-          # Reproduce the exact call the packager makes: absolute path, -xOzf, on the D: drive.
+          # 复现打包器的真实调用方式：绝对路径 + -xOzf，且落在 D: 盘。
           $probe = Join-Path $env:RUNNER_TEMP 'tar-probe'
           New-Item -ItemType Directory -Force -Path (Join-Path $probe 'package') | Out-Null
           Set-Content -LiteralPath (Join-Path $probe 'package/package.json') -Value '{"probe":true}' -Encoding utf8NoBOM
           & $tar -czf (Join-Path $probe 'probe.tgz') -C $probe package
-          if ($LASTEXITCODE -ne 0) { throw "tar -czf failed with $LASTEXITCODE" }
+          if ($LASTEXITCODE -ne 0) { throw "tar -czf 失败，退出码 $LASTEXITCODE" }
           $extracted = & $tar -xOzf (Join-Path $probe 'probe.tgz') package/package.json
-          if ($LASTEXITCODE -ne 0) { throw "tar -xOzf on an absolute path failed with $LASTEXITCODE" }
-          Write-Host "tar    : round trip ok -> $extracted"
+          if ($LASTEXITCODE -ne 0) { throw "tar -xOzf 处理绝对路径失败，退出码 $LASTEXITCODE" }
+          Write-Host "tar    : 绝对路径往返正常 -> $extracted"
 
           foreach ($tool in 'git', 'node', 'pnpm') {
             $found = Get-Command $tool -CommandType Application -ErrorAction SilentlyContinue
-            if ($null -eq $found) { throw "$tool is not on PATH; the Windows desktop build needs it" }
+            if ($null -eq $found) { throw "PATH 中找不到 $tool；Windows 桌面版构建需要它" }
             Write-Host ("{0,-7}: {1}" -f $tool, $found.Source)
           }
 
           $python = Get-Command python -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
           if ($null -eq $python) {
-            # Upstream: set PYTHON when Python is not on PATH.
+            # 上游约定：Python 不在 PATH 中时，用 PYTHON 环境变量指定。
             $candidate = Get-ChildItem 'C:\hostedtoolcache\windows\Python\*\x64\python.exe' -ErrorAction SilentlyContinue | Select-Object -First 1
             if ($null -eq $candidate) {
-              throw 'python is not on PATH and PYTHON is unset; the Windows desktop build needs Python for native module builds'
+              throw 'PATH 中找不到 python，且未设置 PYTHON；Windows 桌面版构建需要 Python 编译原生模块'
             }
             "PYTHON=$($candidate.FullName)" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-            Write-Host "python : $($candidate.FullName) (exported as PYTHON)"
+            Write-Host "python : $($candidate.FullName)（已写入 PYTHON）"
           } else {
             Write-Host "python : $($python.Source)"
           }
 
           $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
-          if (-not (Test-Path $vswhere)) { throw "vswhere.exe not found at $vswhere; Visual C++ Build Tools are required" }
+          if (-not (Test-Path $vswhere)) { throw "在 $vswhere 找不到 vswhere.exe；需要安装 Visual C++ Build Tools" }
           Write-Host "vswhere: $vswhere"
 
       - name: Reclaim disk space
-        # The macOS runner images ship developer runtimes this build never uses.
+        # macOS runner 镜像自带一批本构建用不到的开发运行时。
         if: matrix.target != 'win-x64'
         shell: bash
         continue-on-error: true
@@ -195,10 +195,10 @@ jobs:
           df -h /
 
       - name: Write the Windows release configuration
-        # Windows packaging reads apps/desktop/.env.windows even when unsigned; macOS unsigned
-        # builds use built-in local defaults and need no file.
-        # The production deployment is the one that authenticates anonymously, so a self-built
-        # installer behaves like the official one instead of requiring upstream's test login.
+        # Windows 打包即使未签名也会读取 apps/desktop/.env.windows；
+        # macOS 未签名构建使用内置本地默认值，不需要任何配置文件。
+        # 选 production 部署是因为它是唯一走匿名鉴权的部署，这样自建安装包的行为与官方包一致，
+        # 而不是要求上游内部的测试登录。
         if: matrix.target == 'win-x64'
         shell: pwsh
         env:
@@ -206,13 +206,13 @@ jobs:
         run: |
           $ErrorActionPreference = 'Stop'
           $file = 'apps/desktop/.env.windows'
-          # utf8NoBOM: the dotenv parser strips a BOM, but writing one invites confusion.
+          # 用 utf8NoBOM：dotenv 解析器虽然会剥掉 BOM，但主动写入 BOM 只会带来困惑。
           @(
             'DSH_DESKTOP_APP_ID=com.deepseek.harness'
             'DSH_DESKTOP_AUTO_UPDATE_ENV=production'
             "DSH_DESKTOP_MANDATORY_UPDATE_PROD_ORIGIN=$env:POLICY_ORIGIN"
           ) | Set-Content -LiteralPath $file -Encoding utf8NoBOM
-          # Keys only; the values are deployment identifiers, not secrets.
+          # 只打印键名；这些值是部署标识，不是机密。
           Get-Content $file | ForEach-Object { ($_ -split '=')[0] }
 
       - name: Check configuration and toolchain
@@ -228,7 +228,7 @@ jobs:
         uses: actions/upload-artifact@v7.0.2
         with:
           name: desktop-${{ matrix.tag }}-${{ matrix.target }}
-          # .desktop-build is a hidden directory, so hidden files must be included explicitly.
+          # .desktop-build 是隐藏目录，必须显式允许上传隐藏文件。
           path: apps/desktop/.desktop-build/targets/${{ matrix.target }}/unsigned-artifacts/*
           include-hidden-files: true
           if-no-files-found: error
@@ -247,8 +247,8 @@ jobs:
   publish:
     name: Publish ${{ matrix.tag }}
     needs: [detect, package]
-    # A partial matrix would publish an incomplete release and mark the tag as done, so a failed
-    # target blocks publication unless the run explicitly allows it.
+    # 矩阵里只要有一个目标失败，就不能发布——否则会发出缺文件的 Release，
+    # 并把该 tag 标记成已完成，导致它再也不会重试。除非本次运行显式允许部分失败。
     if: >-
       ${{
         !cancelled()
@@ -270,7 +270,8 @@ jobs:
           path: dist
           merge-multiple: true
 
-      - name: Publish the release
+      - name: Create the release
+        shell: bash
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAG: ${{ matrix.tag }}
@@ -281,12 +282,12 @@ jobs:
           shopt -s nullglob
           files=(dist/*)
           if [ "${#files[@]}" -eq 0 ]; then
-            echo '::error::no installer artifacts were downloaded'
+            echo '::error::没有下载到任何安装包产物'
             exit 1
           fi
           printf '%s\n' "${files[@]}"
 
-          # The release tag is the ledger entry the detect job reads on the next run, so replace it.
+          # Release 的 tag 就是账本条目，detect 下次运行会读它；所以先删掉旧的再重建。
           if gh release view "$LEDGER_TAG" >/dev/null 2>&1; then
             gh release delete "$LEDGER_TAG" --yes --cleanup-tag
           fi
@@ -296,7 +297,7 @@ jobs:
 
           {
             printf '由上游 tag [`%s`](https://github.com/%s/tree/%s) 自动构建。\n\n' "$TAG" "$UPSTREAM" "$TAG"
-            printf -- '- 安装包为**未签名**构建：Windows 会触发 SmartScreen 提示；macOS 首次打开需放行（`xattr -dr com.apple.quarantine "/Applications/DeepSeek Harness.app"`）。\n'
+            printf -- '- 安装包为**未签名**构建：Windows 会触发 SmartScreen 提示；macOS 首次打开需手动放行（`xattr -dr com.apple.quarantine "/Applications/DeepSeek Harness.app"`）。\n'
             printf -- '- 签名发行版需要 Windows EV 硬件令牌或 macOS Developer ID 证书，GitHub 托管 runner 无法提供。\n'
             printf -- '- 构建运行：[`%s`](https://github.com/%s/actions/runs/%s)\n' \
               "$GITHUB_RUN_ID" "$GITHUB_REPOSITORY" "$GITHUB_RUN_ID"
@@ -304,6 +305,6 @@ jobs:
 
           gh release create "$LEDGER_TAG" "${files[@]}" \
             --target "$GITHUB_SHA" \
-            --title "DeepSeek Harness Desktop · ${TAG}" \
+            --title "DeepSeek Harness 桌面版 · ${TAG}" \
             --notes-file notes.md \
             $prerelease
