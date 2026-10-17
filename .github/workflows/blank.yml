@@ -1,152 +1,154 @@
-name: Build DeepSeek Harness Desktop (Daily Check Upstream)
+name: 构建 DeepSeek Harness 桌面端（每日检测上游默认分支）
 
 on:
-  # UTC 0点 每日执行一次
+  # UTC 0点，北京时间早上8点每日检测一次；想要北京时间0点则改为 cron: '0 16 * * *'
   schedule:
     - cron: '0 0 * * *'
-  # 保留手动触发入口
   workflow_dispatch:
     inputs:
-      ref:
-        description: 上游分支/tag
-        default: master
+      引用:
+        description: 手动构建时指定分支/提交哈希/标签，留空使用上游默认分支
+        default: ''
         type: string
 
 env:
-  UPSTREAM_REPO: deepseek-ai/deepseek-harness
-  UPSTREAM_BRANCH: master
-  SHA_FILE: .last-upstream-sha
+  上游仓库: deepseek-ai/deepseek-harness
+  记录文件: .last-upstream-sha
 
 jobs:
-  check_upstream:
-    name: Check upstream commit
+  检测上游:
+    name: 检测上游提交与默认分支
     runs-on: ubuntu-latest
     outputs:
-      changed: ${{ steps.compare.outputs.changed }}
-      latest_sha: ${{ steps.get_sha.outputs.sha }}
+      有更新: ${{ steps.对比.outputs.有更新 }}
+      最新哈希: ${{ steps.获取信息.outputs.最新哈希 }}
+      默认分支: ${{ steps.获取信息.outputs.默认分支 }}
     steps:
-      - name: Checkout this repo (read last saved SHA)
+      - name: 检出本仓库（读取上次保存的提交哈希）
         uses: actions/checkout@v4
 
-      - name: Get upstream latest commit SHA
-        id: get_sha
+      - name: 获取上游仓库信息（默认分支 + 最新提交哈希）
+        id: 获取信息
         run: |
-          curl -s -H "Accept: application/vnd.github.v3+json" "https://api.github.com/repos/${{ env.UPSTREAM_REPO }}/branches/${{ env.UPSTREAM_BRANCH }}" > api.json
-          SHA=$(jq -r '.commit.sha' api.json)
-          echo "sha=$SHA" >> $GITHUB_OUTPUT
-          echo "Latest upstream SHA: $SHA"
+          curl -s -H "Accept: application/vnd.github.v3+json" "https://api.github.com/repos/${{ env.上游仓库 }}" > repo.json
+          默认分支=$(jq -r '.default_branch' repo.json)
+          最新哈希=$(jq -r '.branches["'$默认分支'"].commit.sha' repo.json)
+          echo "默认分支=$默认分支" >> $GITHUB_OUTPUT
+          echo "最新哈希=$最新哈希" >> $GITHUB_OUTPUT
+          echo "上游默认分支: $默认分支"
+          echo "最新提交哈希: $最新哈希"
 
-      - name: Read last saved SHA
-        id: read_last
+      - name: 读取上次记录的哈希
+        id: 读取记录
         run: |
-          if [ -f ${{ env.SHA_FILE }} ]; then
-            LAST=$(cat ${{ env.SHA_FILE }})
+          if [ -f ${{ env.记录文件 }} ]; then
+            上次哈希=$(cat ${{ env.记录文件 }})
           else
-            LAST="none"
+            上次哈希="none"
           fi
-          echo "last_sha=$LAST" >> $GITHUB_OUTPUT
-          echo "Saved last SHA: $LAST"
+          echo "上次哈希=$上次哈希" >> $GITHUB_OUTPUT
+          echo "已保存的上次哈希: $上次哈希"
 
-      - name: Compare SHA
-        id: compare
+      - name: 对比提交哈希
+        id: 对比
         run: |
-          UPSTREAM_SHA=${{ steps.get_sha.outputs.sha }}
-          LAST_SHA=${{ steps.read_last.outputs.last_sha }}
-          if [ "$UPSTREAM_SHA" != "$LAST_SHA" ]; then
-            echo "changed=true" >> $GITHUB_OUTPUT
-            echo "✅ 上游仓库有更新，准备打包"
+          上游最新哈希=${{ steps.获取信息.outputs.最新哈希 }}
+          上次保存哈希=${{ steps.读取记录.outputs.上次哈希 }}
+          if [ "$上游最新哈希" != "$上次保存哈希" ]; then
+            echo "有更新=true" >> $GITHUB_OUTPUT
+            echo "✅ 上游仓库存在更新，准备开始打包"
           else
-            echo "changed=false" >> $GITHUB_OUTPUT
-            echo "⏸️ 上游无更新，终止流程"
+            echo "有更新=false" >> $GITHUB_OUTPUT
+            echo "⏸️ 上游无任何更新，直接终止流程"
           fi
 
-  build:
-    name: ${{ matrix.platform }}
-    needs: check_upstream
-    if: needs.check_upstream.outputs.changed == 'true'
-    runs-on: ${{ matrix.platform }}
+  打包:
+    name: ${{ matrix.平台 }}
+    needs: 检测上游
+    if: needs.检测上游.outputs.有更新 == 'true'
+    runs-on: ${{ matrix.平台 }}
     strategy:
       fail-fast: false
       matrix:
-        platform:
+        平台:
           - windows-latest
           - macos-14
           - macos-13
 
     steps:
-      - name: Checkout upstream deepseek-harness source
+      - name: 检出上游源码
         uses: actions/checkout@v4
         with:
           repository: deepseek-ai/deepseek-harness
-          ref: ${{ github.event.inputs.ref || env.UPSTREAM_BRANCH }}
+          # 手动输入引用优先，否则使用上游默认分支
+          ref: ${{ github.event.inputs.引用 || needs.检测上游.outputs.默认分支 }}
           fetch-depth: 0
 
-      - name: Set npm mirror (CN加速)
+      - name: 设置国内 NPM 镜像加速
         working-directory: ./apps/desktop
         run: npm config set registry https://registry.npmmirror.com
 
-      - name: Setup Node.js 22.19.0
+      - name: 安装 Node.js 22.19.0
         uses: actions/setup-node@v4
         with:
           node-version: '22.19.0'
           cache: 'npm'
           cache-dependency-path: apps/desktop/package-lock.json
 
-      - name: Install dependencies
+      - name: 安装项目依赖
         working-directory: ./apps/desktop
         run: npm ci
 
-      - name: Run tests
+      - name: 执行单元测试
         working-directory: ./apps/desktop
         run: npm test
 
-      - name: Build & Package Electron App
+      - name: 构建并打包 Electron 程序
         working-directory: ./apps/desktop
         run: npm run dist -- --publish never
 
-      - name: Verify packaged bundle
+      - name: 校验打包产物完整性
         working-directory: ./apps/desktop
         run: npm run verify:packaged
 
-      - name: Upload build artifacts
+      - name: 上传打包产物作为制品
         uses: actions/upload-artifact@v4
         with:
-          name: dsh-desktop-${{ matrix.platform }}-${{ needs.check_upstream.outputs.latest_sha }}
+          name: dsh桌面-${{ matrix.平台 }}-${{ needs.检测上游.outputs.最新哈希 }}
           path: apps/desktop/dist/
           retention-days: 30
 
-  release:
-    name: Create GitHub Release
-    needs: build
+  发布版本:
+    name: 创建 GitHub 发布版
+    needs: 打包
     runs-on: ubuntu-latest
     permissions:
       contents: write
     steps:
-      - name: Download all artifacts
+      - name: 下载所有平台打包制品
         uses: actions/download-artifact@v4
 
-      - name: Create GitHub Release
+      - name: 创建发布并上传安装包
         uses: softprops/action-gh-release@v2
         with:
-          name: DeepSeek Harness Desktop Build ${{ needs.check_upstream.outputs.latest_sha }}
+          name: DeepSeek Harness 桌面构建 ${{ needs.检测上游.outputs.最新哈希 }}
           body: >
-            Auto built from upstream commit:
-            https://github.com/deepseek-ai/deepseek-harness/commit/${{ needs.check_upstream.outputs.latest_sha }}
+            自动构建，来源上游默认分支提交：
+            https://github.com/deepseek-ai/deepseek-harness/commit/${{ needs.检测上游.outputs.最新哈希 }}
           generate_release_notes: false
 
-      # ✅ 只有 Release 全部成功才更新 SHA 记录，打包失败不会更新，下次继续重试
-      - name: Update last upstream SHA file
+      - name: 更新上游最新提交哈希记录文件
         run: |
-          echo ${{ needs.check_upstream.outputs.latest_sha }} > ${{ env.SHA_FILE }}
+          echo ${{ needs.检测上游.outputs.最新哈希 }} > ${{ env.记录文件 }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Commit & push updated SHA
+      - name: 提交并推送哈希记录变更
         run: |
           git config --global user.name "github-actions[bot]"
           git config --global user.email "github-actions[bot]@users.noreply.github.com"
-          git add ${{ env.SHA_FILE }}
-          git commit -m "Update last upstream sha: ${{ needs.check_upstream.outputs.latest_sha }}"
+          git add ${{ env.记录文件 }}
+          git commit -m "更新上游记录哈希：${{ needs.检测上游.outputs.最新哈希 }}"
           git push
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
