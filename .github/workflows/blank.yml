@@ -28,10 +28,19 @@ jobs:
 
       - name: 获取官方仓库所有v开头Tag，取最新版本
         id: get_latest_tag
+        shell: bash
         run: |
-          # 获取全部tags，筛选v开头，用sort -V语义版本排序，取最大
-          ALL_TAGS=$(curl -s "https://api.github.com/repos/${{ env.UPSTREAM_REPO }}/tags" | jq -r '.[].name' | grep "^v")
-          LATEST_TAG=$(echo "$ALL_TAGS" | sort -V | tail -n1)
+          set +eo pipefail
+          # 使用内置GITHUB_TOKEN认证调用API，提升访问限额，防限流403
+          RESP=$(curl -s -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" "https://api.github.com/repos/${{ env.UPSTREAM_REPO }}/tags")
+          # 提取所有tag名称，筛选v开头
+          ALL_TAGS=$(echo "$RESP" | jq -r '.[].name' || true)
+          V_TAGS=$(echo "$ALL_TAGS" | grep "^v" || true)
+          if [ -z "$V_TAGS" ]; then
+            LATEST_TAG=""
+          else
+            LATEST_TAG=$(echo "$V_TAGS" | sort -V | tail -n1)
+          fi
           echo "latest_tag=$LATEST_TAG" >> $GITHUB_OUTPUT
           echo "上游最新版本标签: $LATEST_TAG"
 
@@ -51,7 +60,11 @@ jobs:
         run: |
           UPSTREAM_TAG=${{ steps.get_latest_tag.outputs.latest_tag }}
           LAST_SAVED_TAG=${{ steps.read_last.outputs.last_tag }}
-          if [ "$UPSTREAM_TAG" != "$LAST_SAVED_TAG" ]; then
+          # 空tag代表获取失败，不触发打包
+          if [ -z "$UPSTREAM_TAG" ]; then
+            echo "has_new_version=false" >> $GITHUB_OUTPUT
+            echo "⏸️ 获取上游Tag失败，跳过本次构建"
+          elif [ "$UPSTREAM_TAG" != "$LAST_SAVED_TAG" ]; then
             echo "has_new_version=true" >> $GITHUB_OUTPUT
             echo "✅ 发现新版本Tag $UPSTREAM_TAG，准备打包"
           else
