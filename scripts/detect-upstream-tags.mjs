@@ -21,6 +21,8 @@ const RUNNERS = JSON.parse(process.env.TARGET_RUNNERS ?? '{"win-x64":"windows-la
 const REQUIRE_NPM = process.env.REQUIRE_NPM_RUNTIME !== 'false'
 const SELF = process.env.GITHUB_REPOSITORY ?? process.env.STATE_REPOSITORY ?? ''
 const FORCE_TAG = (process.env.FORCE_TAG ?? '').trim()
+/** npm package holding the runtime each installer bundles; rename it here if upstream renames it. */
+const NPM_PACKAGE = process.env.NPM_RUNTIME_PACKAGE ?? '@deepseek-ai/dsh'
 
 /** The unsigned packaging entry point upstream exposes for each supported target. */
 const PACKAGE_SCRIPTS = {
@@ -95,16 +97,33 @@ async function apiPage(url) {
   return response.json()
 }
 
-/** All upstream tag names under the release prefix. */
+/**
+ * All upstream tag names under the release prefix.
+ *
+ * Returns the total tag count as well: a repository that clearly has tags but yields no match means
+ * the naming convention moved, and that must fail loudly instead of reporting "nothing to do".
+ */
 async function upstreamTags() {
   const names = []
-  for (let page = 1; page <= 20; page += 1) {
+  let truncated = false
+  const MAX_PAGES = 50
+  for (let page = 1; page <= MAX_PAGES; page += 1) {
     const batch = await apiPage(`https://api.github.com/repos/${UPSTREAM}/tags?per_page=100&page=${page}`)
     if (batch === undefined) throw new Error(`upstream repository ${UPSTREAM} is not reachable`)
     names.push(...batch.map(entry => entry.name))
     if (batch.length < 100) break
+    if (page === MAX_PAGES) truncated = true
   }
-  return [...new Set(names)].filter(name => name.startsWith(TAG_PREFIX))
+  const unique = [...new Set(names)]
+  const matched = unique.filter(name => name.startsWith(TAG_PREFIX))
+  if (matched.length === 0 && unique.length > 0) {
+    throw new Error(
+      `upstream ${UPSTREAM} has ${unique.length} tags but none start with "${TAG_PREFIX}"; `
+      + `the tag convention probably changed (newest seen: "${unique[0]}"). `
+      + `Update UPSTREAM_TAG_PREFIX instead of touching this script.`,
+    )
+  }
+  return { matched, total: unique.length, truncated }
 }
 
 /** Upstream tags this repository already published a desktop release for. */
@@ -130,7 +149,7 @@ async function processedTags() {
 
 /** The packaged runtime is installed from npm, so an unpublished version cannot be packaged yet. */
 async function publishedOnNpm(version) {
-  const response = await fetch(`https://registry.npmjs.org/@deepseek-ai/dsh/${encodeURIComponent(version)}`, {
+  const response = await fetch(`https://registry.npmjs.org/${NPM_PACKAGE}/${encodeURIComponent(version)}`, {
     headers: { accept: 'application/json', 'user-agent': 'desktop-tag-watch' },
   })
   return response.status === 200
@@ -140,6 +159,16 @@ async function main() {
   const targets = Object.entries(RUNNERS).map(([target, runsOn]) => ({ target, runsOn }))
   const known = await processedTags()
   const version = tag => tag.slice(TAG_PREFIX.length)
+  const { matched, total, truncated } = await upstreamTags()
+
+  // A version scheme this parser no longer understands would skip every tag as "unparseable".
+  const parseable = matched.filter(tag => parseVersion(version(tag)) !== undefined)
+  if (matched.length > 0 && parseable.length === 0) {
+    throw new Error(
+      `${matched.length} upstream tags start with "${TAG_PREFIX}" but none parse as semver `
+      + `(newest: "${matched[0]}"); the version scheme changed and this pipeline needs updating.`,
+    )
+  }
 
   // The newest already-published version bounds the work: a tag older than it is release history,
   // not a new release, so publishing it would backfill and re-publish stale installers.
@@ -150,11 +179,10 @@ async function main() {
     if (newestKnown === undefined || compareVersions(candidate, newestKnown) > 0) newestKnown = candidate
   }
 
-  const upstream = (await upstreamTags())
-    .filter(tag => parseVersion(version(tag)) !== undefined)
+  const pending = [...parseable]
     .sort((left, right) => compareVersions(version(right), version(left)))
-  const pending = upstream.filter(tag => !known.has(tag)
-    && (newestKnown === undefined || compareVersions(version(tag), newestKnown) > 0))
+    .filter(tag => !known.has(tag)
+      && (newestKnown === undefined || compareVersions(version(tag), newestKnown) > 0))
 
   // A fresh ledger would otherwise walk the whole back catalogue one entry per scheduled run.
   const queue = newestKnown === undefined ? pending.slice(0, 1) : pending.slice(0, MAX_TAGS)
@@ -191,16 +219,30 @@ async function main() {
   const unknown = matrix.find(entry => entry.script === undefined)
   if (unknown !== undefined) throw new Error(`unsupported target: ${unknown.target}`)
 
+  const npmBlocked = skipped.filter(entry => entry.reason === 'runtime not published to npm yet')
+  const warnings = [
+    ...(truncated ? [`Only the first ${total} upstream tags were read; raise MAX pages if the history grows.`] : []),
+    // Every candidate blocked on npm usually means the package was renamed, not that npm is slow
+    // for weeks — surface it as an annotation instead of a quietly green run.
+    ...(pending.length > 0 && selected.length === 0 && npmBlocked.length === pending.length
+      ? [`All ${npmBlocked.length} pending tag(s) are missing from npm as \`${NPM_PACKAGE}\`; if this persists, the runtime package was probably renamed (set NPM_RUNTIME_PACKAGE).`]
+      : []),
+  ]
+
   const summary = [
     '## Upstream tag watch',
     '',
-    `Upstream: \`${UPSTREAM}\` | ledger: \`${SELF || 'not configured'}\` | released: ${known.size} | newest released: \`${newestKnown ?? 'none'}\``,
+    `Upstream: \`${UPSTREAM}\` | ledger: \`${SELF || 'not configured'}\` | tags seen: ${total} | released: ${known.size} | newest released: \`${newestKnown ?? 'none'}\``,
     '',
     selected.length === 0
       ? `Nothing to package. Pending newer tags: ${pending.length}.`
       : `Selected: ${selected.map(entry => `\`${entry.tag}\``).join(', ')} (newer than \`${newestKnown ?? 'ledger bootstrap'}\`)`,
     ...(skipped.length === 0 ? [] : ['', 'Skipped:', ...skipped.map(entry => `- \`${entry.tag}\`: ${entry.reason}`)]),
+    ...(warnings.length === 0 ? [] : ['', ...warnings.map(text => `> [!WARNING]\n> ${text}`)]),
   ].join('\n')
+
+  // GitHub renders ::warning:: as an annotation on the run, which is visible without opening logs.
+  for (const text of warnings) console.log(`::warning::${text}`)
 
   console.log(summary)
   if (process.env.GITHUB_STEP_SUMMARY) appendFileSync(process.env.GITHUB_STEP_SUMMARY, `${summary}\n`)
