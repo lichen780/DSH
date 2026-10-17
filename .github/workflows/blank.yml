@@ -1,4 +1,4 @@
-name: 构建 DeepSeek Harness 桌面端（每日检测上游默认分支）
+name: 构建 DeepSeek Harness 桌面端（每日检测官方版本Tag）
 
 on:
   # UTC 0点，北京时间早上8点每日检测一次；想要北京时间0点则改为 cron: '0 16 * * *'
@@ -7,65 +7,72 @@ on:
   workflow_dispatch:
     inputs:
       ref:
-        description: 手动构建时指定分支/提交哈希/标签，留空使用上游默认分支
+        description: 手动构建时指定版本标签/分支/提交哈希，留空自动拉最新官方版本Tag
         default: ''
         type: string
 
 env:
   UPSTREAM_REPO: deepseek-ai/deepseek-harness
-  SHA_FILE: .last-upstream-sha
+  RECORD_FILE: .last-dsh-version-tag
 
 jobs:
   check_upstream:
-    name: 检测上游提交与默认分支
+    name: 检测上游最新版本Tag
     runs-on: ubuntu-latest
     outputs:
-      changed: ${{ steps.compare.outputs.changed }}
-      latest_sha: ${{ steps.get_info.outputs.latest_sha }}
-      default_branch: ${{ steps.get_info.outputs.default_branch }}
+      has_new_version: ${{ steps.compare.outputs.has_new_version }}
+      latest_tag: ${{ steps.get_latest_tag.outputs.latest_tag }}
+      target_commit: ${{ steps.get_latest_tag.outputs.target_commit }}
     steps:
-      - name: 检出本仓库（读取上次保存的提交哈希）
+      - name: 检出本仓库（读取上次记录的版本标签）
         uses: actions/checkout@v4
 
-      - name: 获取上游仓库信息（默认分支 + 最新提交哈希）
-        id: get_info
+      - name: 获取官方仓库最新v开头版本Tag
+        id: get_latest_tag
         run: |
-          curl -s -H "Accept: application/vnd.github.v3+json" "https://api.github.com/repos/${{ env.UPSTREAM_REPO }}" > repo.json
-          DEFAULT_BRANCH=$(jq -r '.default_branch' repo.json)
-          LATEST_SHA=$(jq -r '.branches["'$DEFAULT_BRANCH'"].commit.sha' repo.json)
-          echo "default_branch=$DEFAULT_BRANCH" >> $GITHUB_OUTPUT
-          echo "latest_sha=$LATEST_SHA" >> $GITHUB_OUTPUT
-          echo "上游默认分支: $DEFAULT_BRANCH"
-          echo "最新提交哈希: $LATEST_SHA"
+          # 获取所有v开头的tag，按版本号排序取最新
+          LATEST_TAG=$(curl -s "https://api.github.com/repos/${{ env.UPSTREAM_REPO }}/tags" | jq -r '
+            [.[] | select(.name | startswith("v"))]
+            | sort_by(.name | sub("^v";"") | split("-")[0] | split(".") | map(tonumber))
+            | last | .name
+          ')
+          # 获取该tag对应的commit哈希
+          TARGET_COMMIT=$(curl -s "https://api.github.com/repos/${{ env.UPSTREAM_REPO }}/tags" | jq -r '
+            [.[] | select(.name == "'"$LATEST_TAG"'")] | first | .commit.sha
+          ')
+          echo "latest_tag=$LATEST_TAG" >> $GITHUB_OUTPUT
+          echo "target_commit=$TARGET_COMMIT" >> $GITHUB_OUTPUT
+          echo "上游最新版本标签: $LATEST_TAG"
+          echo "版本对应提交哈希: $TARGET_COMMIT"
 
-      - name: 读取上次记录的哈希
+      - name: 读取上次记录的版本标签
         id: read_last
         run: |
-          if [ -f ${{ env.SHA_FILE }} ]; then
-            LAST_SHA=$(cat ${{ env.SHA_FILE }})
+          if [ -f ${{ env.RECORD_FILE }} ]; then
+            LAST_TAG=$(cat ${{ env.RECORD_FILE }})
           else
-            LAST_SHA="none"
+            LAST_TAG="none"
           fi
-          echo "last_sha=$LAST_SHA" >> $GITHUB_OUTPUT
-          echo "已保存的上次哈希: $LAST_SHA"
+          echo "last_tag=$LAST_TAG" >> $GITHUB_OUTPUT
+          echo "上次构建的版本标签: $LAST_TAG"
 
-      - name: 对比提交哈希
+      - name: 对比版本标签
         id: compare
         run: |
-          UPSTREAM_SHA=${{ steps.get_info.outputs.latest_sha }}
-          LAST_SAVED_SHA=${{ steps.read_last.outputs.last_sha }}
-          if [ "$UPSTREAM_SHA" != "$LAST_SAVED_SHA" ]; then
-            echo "changed=true" >> $GITHUB_OUTPUT
-            echo "✅ 上游仓库存在更新，准备开始打包"
+          UPSTREAM_TAG=${{ steps.get_latest_tag.outputs.latest_tag }}
+          LAST_SAVED_TAG=${{ steps.read_last.outputs.last_tag }}
+          if [ "$UPSTREAM_TAG" != "$LAST_SAVED_TAG" ]; then
+            echo "has_new_version=true" >> $GITHUB_OUTPUT
+            echo "✅ 发现新版本标签 $UPSTREAM_TAG，准备开始打包"
           else
-            echo "changed=false" >> $GITHUB_OUTPUT
-            echo "⏸️ 上游无任何更新，直接终止流程"
+            echo "has_new_version=false" >> $GITHUB_OUTPUT
+            echo "⏸️ 上游没有发布新版本，直接终止流程"
           fi
 
   build:
     name: ${{ matrix.platform }}
     needs: check_upstream
-    if: needs.check_upstream.outputs.changed == 'true'
+    if: needs.check_upstream.outputs.has_new_version == 'true'
     runs-on: ${{ matrix.platform }}
     strategy:
       fail-fast: false
@@ -73,20 +80,15 @@ jobs:
         platform:
           - windows-latest
           - macos-14
-          - macos-13
 
     steps:
-      - name: 检出上游源码
+      - name: 检出上游源码（对应最新版本Tag）
         uses: actions/checkout@v4
         with:
-          repository: deepseek-ai/deepseek-harness
-          # 手动输入引用优先，否则使用上游默认分支
-          ref: ${{ github.event.inputs.ref || needs.check_upstream.outputs.default_branch }}
+          repository: ${{ env.UPSTREAM_REPO }}
+          # 手动输入优先，否则使用检测到的最新版本tag
+          ref: ${{ github.event.inputs.ref || needs.check_upstream.outputs.latest_tag }}
           fetch-depth: 0
-
-      - name: 设置国内 NPM 镜像加速
-        working-directory: ./apps/desktop
-        run: npm config set registry https://registry.npmmirror.com
 
       - name: 安装 Node.js 22.19.0
         uses: actions/setup-node@v4
@@ -114,7 +116,7 @@ jobs:
       - name: 上传打包产物作为制品
         uses: actions/upload-artifact@v4
         with:
-          name: dsh桌面-${{ matrix.platform }}-${{ needs.check_upstream.outputs.latest_sha }}
+          name: dsh桌面-${{ matrix.platform }}-${{ needs.check_upstream.outputs.latest_tag }}
           path: apps/desktop/dist/
           retention-days: 30
 
@@ -131,24 +133,24 @@ jobs:
       - name: 创建发布并上传安装包
         uses: softprops/action-gh-release@v2
         with:
-          name: DeepSeek Harness 桌面构建 ${{ needs.check_upstream.outputs.latest_sha }}
+          name: DeepSeek Harness 桌面构建 ${{ needs.check_upstream.outputs.latest_tag }}
           body: >
-            自动构建，来源上游默认分支提交：
-            https://github.com/deepseek-ai/deepseek-harness/commit/${{ needs.check_upstream.outputs.latest_sha }}
+            自动构建，来源官方版本标签：${{ needs.check_upstream.outputs.latest_tag }}
+            https://github.com/deepseek-ai/deepseek-harness/releases/tag/${{ needs.check_upstream.outputs.latest_tag }}
           generate_release_notes: false
 
-      - name: 更新上游最新提交哈希记录文件
+      - name: 更新版本标签记录文件
         run: |
-          echo ${{ needs.check_upstream.outputs.latest_sha }} > ${{ env.SHA_FILE }}
+          echo ${{ needs.check_upstream.outputs.latest_tag }} > ${{ env.RECORD_FILE }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: 提交并推送哈希记录变更
+      - name: 提交并推送版本记录变更
         run: |
           git config --global user.name "github-actions[bot]"
           git config --global user.email "github-actions[bot]@users.noreply.github.com"
-          git add ${{ env.SHA_FILE }}
-          git commit -m "更新上游记录哈希：${{ needs.check_upstream.outputs.latest_sha }}"
+          git add ${{ env.RECORD_FILE }}
+          git commit -m "更新记录版本标签：${{ needs.check_upstream.outputs.latest_tag }}"
           git push
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
