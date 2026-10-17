@@ -35,6 +35,8 @@ env:
   UPSTREAM_REPO: deepseek-ai/deepseek-harness
   UPSTREAM_TAG_PREFIX: dsh-v
   PROCESSED_TAG_PREFIX: desktop-
+  # Runtime each installer bundles; the packaged version must exist here before a tag can build.
+  NPM_RUNTIME_PACKAGE: '@deepseek-ai/dsh'
   MAX_TAGS_PER_RUN: '2'
   # Never report to the production telemetry endpoint baked into apps/cli/cordis.yml.
   DSH_TELEMETRY_DISABLED: '1'
@@ -66,9 +68,12 @@ jobs:
             target="$(echo "$raw" | tr -d '[:space:]')"
             [ -n "$target" ] || continue
             case "$target" in
+              # The plain macOS labels are Intel x64 and the -arm64 labels are Apple Silicon:
+              # macos-14's image manifest lists JAVA_HOME_*_X64 and chromedriver-mac-x64.
+              # macos-13 is retired, and macos-14 is being sunset, so both targets use macOS 15.
               win-x64)   entries+=("\"win-x64\":\"windows-latest\"") ;;
-              mac-arm64) entries+=("\"mac-arm64\":\"macos-14\"") ;;
-              mac-x64)   entries+=("\"mac-x64\":\"macos-13\"") ;;
+              mac-arm64) entries+=("\"mac-arm64\":\"macos-15-arm64\"") ;;
+              mac-x64)   entries+=("\"mac-x64\":\"macos-15\"") ;;
               *) echo "::error::unknown target '$target' (expected win-x64, mac-arm64 or mac-x64)"; exit 1 ;;
             esac
           done
@@ -95,9 +100,11 @@ jobs:
         include: ${{ fromJSON(needs.detect.outputs.matrix) }}
     runs-on: ${{ matrix.runsOn }}
     timeout-minutes: 300
-    defaults:
-      run:
-        shell: bash
+    # Every run step below sets its shell explicitly, and Windows steps use pwsh rather than bash.
+    # Git Bash puts /usr/bin/tar (GNU tar) ahead of the bundled bsdtar on PATH, and GNU tar reads
+    # the "D:" in "D:\a\..." as a remote host, so tar fails with "Cannot connect to D: resolve
+    # failed" — exactly the failure this pipeline used to hit in prepare:packages. pwsh is present
+    # on both the Windows and the macOS runner images, so the shared steps use it too.
     steps:
       - uses: actions/checkout@v7.0.1
         with:
@@ -107,18 +114,11 @@ jobs:
           fetch-depth: 1
 
       - name: Verify the tag matches the product version
-        shell: bash
+        shell: pwsh
         env:
           EXPECTED_TAG: ${{ matrix.tag }}
         run: |
-          set -euo pipefail
-          version="$(node -p "require('./package.json').version")"
-          echo "tag=$EXPECTED_TAG package.json=$version"
-          # The packaging entry point rejects a mismatch later; fail here with a clear reason instead.
-          if [ "$EXPECTED_TAG" != "${UPSTREAM_TAG_PREFIX}${version}" ]; then
-            echo "::error::upstream tag $EXPECTED_TAG does not match package.json version $version"
-            exit 1
-          fi
+          node -e 'const fs=require("node:fs");const v=JSON.parse(fs.readFileSync("package.json","utf8")).version;const want=process.env.UPSTREAM_TAG_PREFIX+v;if(process.env.EXPECTED_TAG!==want){console.error("::error::upstream tag "+process.env.EXPECTED_TAG+" does not match package.json version "+v);process.exit(1)}console.log("tag "+process.env.EXPECTED_TAG+" matches package.json "+v)'
 
       - uses: pnpm/action-setup@v6.1.0
 
@@ -128,11 +128,64 @@ jobs:
           cache: pnpm
 
       - name: Install locked dependencies
+        shell: pwsh
         run: pnpm install --frozen-lockfile
+
+      - name: Verify the Windows build toolchain
+        # Upstream (apps/desktop/packaging/README.zh.md) requires Node 24, pnpm, Git, PowerShell,
+        # tar, Python, Visual C++ Build Tools and the Windows SDK. Asserting them here turns a
+        # missing tool into a seconds-long failure instead of a 40-minute build that dies late.
+        # The tar check is the important one: `--check` probes tar with relative paths inside a
+        # temp directory, so it passes with GNU tar even though the real build uses absolute paths
+        # and fails there.
+        if: matrix.target == 'win-x64'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          $tar = (Get-Command tar -CommandType Application | Select-Object -First 1).Source
+          $tarVersion = (& $tar --version | Select-Object -First 1)
+          Write-Host "tar    : $tar ($tarVersion)"
+          if ($tarVersion -notmatch 'bsdtar') {
+            throw "tar resolved to '$tar' ($tarVersion). Windows packaging needs the bundled bsdtar: GNU tar treats the 'D:' in an absolute path as a remote host and aborts with 'Cannot connect to D: resolve failed'."
+          }
+          # Reproduce the exact call the packager makes: absolute path, -xOzf, on the D: drive.
+          $probe = Join-Path $env:RUNNER_TEMP 'tar-probe'
+          New-Item -ItemType Directory -Force -Path (Join-Path $probe 'package') | Out-Null
+          Set-Content -LiteralPath (Join-Path $probe 'package/package.json') -Value '{"probe":true}' -Encoding utf8NoBOM
+          & $tar -czf (Join-Path $probe 'probe.tgz') -C $probe package
+          if ($LASTEXITCODE -ne 0) { throw "tar -czf failed with $LASTEXITCODE" }
+          $extracted = & $tar -xOzf (Join-Path $probe 'probe.tgz') package/package.json
+          if ($LASTEXITCODE -ne 0) { throw "tar -xOzf on an absolute path failed with $LASTEXITCODE" }
+          Write-Host "tar    : round trip ok -> $extracted"
+
+          foreach ($tool in 'git', 'node', 'pnpm') {
+            $found = Get-Command $tool -CommandType Application -ErrorAction SilentlyContinue
+            if ($null -eq $found) { throw "$tool is not on PATH; the Windows desktop build needs it" }
+            Write-Host ("{0,-7}: {1}" -f $tool, $found.Source)
+          }
+
+          $python = Get-Command python -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
+          if ($null -eq $python) {
+            # Upstream: set PYTHON when Python is not on PATH.
+            $candidate = Get-ChildItem 'C:\hostedtoolcache\windows\Python\*\x64\python.exe' -ErrorAction SilentlyContinue | Select-Object -First 1
+            if ($null -eq $candidate) {
+              throw 'python is not on PATH and PYTHON is unset; the Windows desktop build needs Python for native module builds'
+            }
+            "PYTHON=$($candidate.FullName)" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+            Write-Host "python : $($candidate.FullName) (exported as PYTHON)"
+          } else {
+            Write-Host "python : $($python.Source)"
+          }
+
+          $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
+          if (-not (Test-Path $vswhere)) { throw "vswhere.exe not found at $vswhere; Visual C++ Build Tools are required" }
+          Write-Host "vswhere: $vswhere"
 
       - name: Reclaim disk space
         # The macOS runner images ship developer runtimes this build never uses.
         if: matrix.target != 'win-x64'
+        shell: bash
         continue-on-error: true
         run: |
           set -euo pipefail
@@ -147,29 +200,28 @@ jobs:
         # The production deployment is the one that authenticates anonymously, so a self-built
         # installer behaves like the official one instead of requiring upstream's test login.
         if: matrix.target == 'win-x64'
-        shell: bash
+        shell: pwsh
         env:
           POLICY_ORIGIN: ${{ vars.DSH_POLICY_ORIGIN || 'https://download.deepseek.com' }}
         run: |
-          set -euo pipefail
-          file=apps/desktop/.env.windows
-          {
-            printf 'DSH_DESKTOP_APP_ID=com.deepseek.harness\n'
-            printf 'DSH_DESKTOP_AUTO_UPDATE_ENV=production\n'
-            printf 'DSH_DESKTOP_MANDATORY_UPDATE_PROD_ORIGIN=%s\n' "$POLICY_ORIGIN"
-          } > "$file"
+          $ErrorActionPreference = 'Stop'
+          $file = 'apps/desktop/.env.windows'
+          # utf8NoBOM: the dotenv parser strips a BOM, but writing one invites confusion.
+          @(
+            'DSH_DESKTOP_APP_ID=com.deepseek.harness'
+            'DSH_DESKTOP_AUTO_UPDATE_ENV=production'
+            "DSH_DESKTOP_MANDATORY_UPDATE_PROD_ORIGIN=$env:POLICY_ORIGIN"
+          ) | Set-Content -LiteralPath $file -Encoding utf8NoBOM
           # Keys only; the values are deployment identifiers, not secrets.
-          cut -d= -f1 "$file"
+          Get-Content $file | ForEach-Object { ($_ -split '=')[0] }
 
       - name: Check configuration and toolchain
-        run: |
-          set -euo pipefail
-          pnpm --dir apps/desktop run "${{ matrix.script }}" --check --build-version "${{ matrix.version }}"
+        shell: pwsh
+        run: pnpm --dir apps/desktop run "${{ matrix.script }}" --check --build-version "${{ matrix.version }}"
 
       - name: Build unsigned installers
-        run: |
-          set -euo pipefail
-          pnpm --dir apps/desktop run "${{ matrix.script }}" --build-version "${{ matrix.version }}"
+        shell: pwsh
+        run: pnpm --dir apps/desktop run "${{ matrix.script }}" --build-version "${{ matrix.version }}"
 
       - name: Upload installers
         if: success()
