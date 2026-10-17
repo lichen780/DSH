@@ -1,0 +1,152 @@
+name: Build DeepSeek Harness Desktop (Daily Check Upstream)
+
+on:
+  # UTC 0点 每日执行一次
+  schedule:
+    - cron: '0 0 * * *'
+  # 保留手动触发入口
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: 上游分支/tag
+        default: master
+        type: string
+
+env:
+  UPSTREAM_REPO: deepseek-ai/deepseek-harness
+  UPSTREAM_BRANCH: master
+  SHA_FILE: .last-upstream-sha
+
+jobs:
+  check_upstream:
+    name: Check upstream commit
+    runs-on: ubuntu-latest
+    outputs:
+      changed: ${{ steps.compare.outputs.changed }}
+      latest_sha: ${{ steps.get_sha.outputs.sha }}
+    steps:
+      - name: Checkout this repo (read last saved SHA)
+        uses: actions/checkout@v4
+
+      - name: Get upstream latest commit SHA
+        id: get_sha
+        run: |
+          curl -s -H "Accept: application/vnd.github.v3+json" "https://api.github.com/repos/${{ env.UPSTREAM_REPO }}/branches/${{ env.UPSTREAM_BRANCH }}" > api.json
+          SHA=$(jq -r '.commit.sha' api.json)
+          echo "sha=$SHA" >> $GITHUB_OUTPUT
+          echo "Latest upstream SHA: $SHA"
+
+      - name: Read last saved SHA
+        id: read_last
+        run: |
+          if [ -f ${{ env.SHA_FILE }} ]; then
+            LAST=$(cat ${{ env.SHA_FILE }})
+          else
+            LAST="none"
+          fi
+          echo "last_sha=$LAST" >> $GITHUB_OUTPUT
+          echo "Saved last SHA: $LAST"
+
+      - name: Compare SHA
+        id: compare
+        run: |
+          UPSTREAM_SHA=${{ steps.get_sha.outputs.sha }}
+          LAST_SHA=${{ steps.read_last.outputs.last_sha }}
+          if [ "$UPSTREAM_SHA" != "$LAST_SHA" ]; then
+            echo "changed=true" >> $GITHUB_OUTPUT
+            echo "✅ 上游仓库有更新，准备打包"
+          else
+            echo "changed=false" >> $GITHUB_OUTPUT
+            echo "⏸️ 上游无更新，终止流程"
+          fi
+
+  build:
+    name: ${{ matrix.platform }}
+    needs: check_upstream
+    if: needs.check_upstream.outputs.changed == 'true'
+    runs-on: ${{ matrix.platform }}
+    strategy:
+      fail-fast: false
+      matrix:
+        platform:
+          - windows-latest
+          - macos-14
+          - macos-13
+
+    steps:
+      - name: Checkout upstream deepseek-harness source
+        uses: actions/checkout@v4
+        with:
+          repository: deepseek-ai/deepseek-harness
+          ref: ${{ github.event.inputs.ref || env.UPSTREAM_BRANCH }}
+          fetch-depth: 0
+
+      - name: Set npm mirror (CN加速)
+        working-directory: ./apps/desktop
+        run: npm config set registry https://registry.npmmirror.com
+
+      - name: Setup Node.js 22.19.0
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22.19.0'
+          cache: 'npm'
+          cache-dependency-path: apps/desktop/package-lock.json
+
+      - name: Install dependencies
+        working-directory: ./apps/desktop
+        run: npm ci
+
+      - name: Run tests
+        working-directory: ./apps/desktop
+        run: npm test
+
+      - name: Build & Package Electron App
+        working-directory: ./apps/desktop
+        run: npm run dist -- --publish never
+
+      - name: Verify packaged bundle
+        working-directory: ./apps/desktop
+        run: npm run verify:packaged
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: dsh-desktop-${{ matrix.platform }}-${{ needs.check_upstream.outputs.latest_sha }}
+          path: apps/desktop/dist/
+          retention-days: 30
+
+  release:
+    name: Create GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: DeepSeek Harness Desktop Build ${{ needs.check_upstream.outputs.latest_sha }}
+          body: >
+            Auto built from upstream commit:
+            https://github.com/deepseek-ai/deepseek-harness/commit/${{ needs.check_upstream.outputs.latest_sha }}
+          generate_release_notes: false
+
+      # ✅ 只有 Release 全部成功才更新 SHA 记录，打包失败不会更新，下次继续重试
+      - name: Update last upstream SHA file
+        run: |
+          echo ${{ needs.check_upstream.outputs.latest_sha }} > ${{ env.SHA_FILE }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Commit & push updated SHA
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          git add ${{ env.SHA_FILE }}
+          git commit -m "Update last upstream sha: ${{ needs.check_upstream.outputs.latest_sha }}"
+          git push
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
