@@ -1,13 +1,13 @@
-name: 构建 DeepSeek Harness 桌面端（每日检测官方版本Tag）
+name: 构建 DeepSeek Harness 桌面端（每日检测官方Tag版本）
 
 on:
-  # UTC 0点，北京时间早上8点每日检测一次；想要北京时间0点则改为 cron: '0 16 * * *'
+  # UTC 0点，北京时间早上8点每日检测；想要北京时间0点则改为 cron: '0 16 * * *'
   schedule:
     - cron: '0 0 * * *'
   workflow_dispatch:
     inputs:
       ref:
-        description: 手动构建时指定版本标签/分支/提交哈希，留空自动拉最新官方版本Tag
+        description: 手动构建指定版本标签/分支/提交哈希，留空自动拉最新v开头Tag
         default: ''
         type: string
 
@@ -17,33 +17,23 @@ env:
 
 jobs:
   check_upstream:
-    name: 检测上游最新版本Tag
+    name: 检测上游最新Tag
     runs-on: ubuntu-latest
     outputs:
       has_new_version: ${{ steps.compare.outputs.has_new_version }}
       latest_tag: ${{ steps.get_latest_tag.outputs.latest_tag }}
-      target_commit: ${{ steps.get_latest_tag.outputs.target_commit }}
     steps:
-      - name: 检出本仓库（读取上次记录的版本标签）
+      - name: 检出本仓库（读取上次记录版本）
         uses: actions/checkout@v4
 
-      - name: 获取官方仓库最新v开头版本Tag
+      - name: 获取官方仓库所有v开头Tag，取最新版本
         id: get_latest_tag
         run: |
-          # 获取所有v开头的tag，按版本号排序取最新
-          LATEST_TAG=$(curl -s "https://api.github.com/repos/${{ env.UPSTREAM_REPO }}/tags" | jq -r '
-            [.[] | select(.name | startswith("v"))]
-            | sort_by(.name | sub("^v";"") | split("-")[0] | split(".") | map(tonumber))
-            | last | .name
-          ')
-          # 获取该tag对应的commit哈希
-          TARGET_COMMIT=$(curl -s "https://api.github.com/repos/${{ env.UPSTREAM_REPO }}/tags" | jq -r '
-            [.[] | select(.name == "'"$LATEST_TAG"'")] | first | .commit.sha
-          ')
+          # 获取全部tags，筛选v开头，用sort -V语义版本排序，取最大
+          ALL_TAGS=$(curl -s "https://api.github.com/repos/${{ env.UPSTREAM_REPO }}/tags" | jq -r '.[].name' | grep "^v")
+          LATEST_TAG=$(echo "$ALL_TAGS" | sort -V | tail -n1)
           echo "latest_tag=$LATEST_TAG" >> $GITHUB_OUTPUT
-          echo "target_commit=$TARGET_COMMIT" >> $GITHUB_OUTPUT
           echo "上游最新版本标签: $LATEST_TAG"
-          echo "版本对应提交哈希: $TARGET_COMMIT"
 
       - name: 读取上次记录的版本标签
         id: read_last
@@ -63,10 +53,10 @@ jobs:
           LAST_SAVED_TAG=${{ steps.read_last.outputs.last_tag }}
           if [ "$UPSTREAM_TAG" != "$LAST_SAVED_TAG" ]; then
             echo "has_new_version=true" >> $GITHUB_OUTPUT
-            echo "✅ 发现新版本标签 $UPSTREAM_TAG，准备开始打包"
+            echo "✅ 发现新版本Tag $UPSTREAM_TAG，准备打包"
           else
             echo "has_new_version=false" >> $GITHUB_OUTPUT
-            echo "⏸️ 上游没有发布新版本，直接终止流程"
+            echo "⏸️ 上游没有新增Tag，直接终止流程"
           fi
 
   build:
@@ -82,11 +72,11 @@ jobs:
           - macos-14
 
     steps:
-      - name: 检出上游源码（对应最新版本Tag）
+      - name: 检出上游源码（对应最新Tag）
         uses: actions/checkout@v4
         with:
           repository: ${{ env.UPSTREAM_REPO }}
-          # 手动输入优先，否则使用检测到的最新版本tag
+          # 手动输入优先，否则自动使用检测到的最新tag
           ref: ${{ github.event.inputs.ref || needs.check_upstream.outputs.latest_tag }}
           fetch-depth: 0
 
@@ -135,8 +125,8 @@ jobs:
         with:
           name: DeepSeek Harness 桌面构建 ${{ needs.check_upstream.outputs.latest_tag }}
           body: >
-            自动构建，来源官方版本标签：${{ needs.check_upstream.outputs.latest_tag }}
-            https://github.com/deepseek-ai/deepseek-harness/releases/tag/${{ needs.check_upstream.outputs.latest_tag }}
+            自动构建，来源官方Tag版本：${{ needs.check_upstream.outputs.latest_tag }}
+            https://github.com/deepseek-ai/deepseek-harness/tree/${{ needs.check_upstream.outputs.latest_tag }}
           generate_release_notes: false
 
       - name: 更新版本标签记录文件
