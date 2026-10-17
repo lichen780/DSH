@@ -228,8 +228,15 @@ jobs:
         uses: actions/upload-artifact@v7.0.2
         with:
           name: desktop-${{ matrix.tag }}-${{ matrix.target }}
-          # .desktop-build 是隐藏目录，必须显式允许上传隐藏文件。
-          path: apps/desktop/.desktop-build/targets/${{ matrix.target }}/unsigned-artifacts/*
+          # electron-builder 的输出目录里除了安装包，还有解包目录（win-unpacked/mac*/）和
+          # builder-debug.yml 这类调试文件。它们体积大、不是产物，传上去会让发布步骤把目录
+          # 当文件交给 gh，因此在这里排除。.desktop-build 是隐藏目录，需显式允许隐藏文件。
+          path: |
+            apps/desktop/.desktop-build/targets/${{ matrix.target }}/unsigned-artifacts/*
+            !apps/desktop/.desktop-build/targets/${{ matrix.target }}/unsigned-artifacts/**-unpacked/**
+            !apps/desktop/.desktop-build/targets/${{ matrix.target }}/unsigned-artifacts/mac/**
+            !apps/desktop/.desktop-build/targets/${{ matrix.target }}/unsigned-artifacts/builder-debug.yml
+            !apps/desktop/.desktop-build/targets/${{ matrix.target }}/unsigned-artifacts/builder-effective-config.yaml
           include-hidden-files: true
           if-no-files-found: error
           retention-days: 14
@@ -277,19 +284,33 @@ jobs:
           TAG: ${{ matrix.tag }}
           UPSTREAM: ${{ env.UPSTREAM_REPO }}
           LEDGER_TAG: ${{ env.PROCESSED_TAG_PREFIX }}${{ matrix.tag }}
+          # 这个 job 没有 checkout 仓库，gh 无法从 git 推断仓库名，会报
+          # "failed to run git: fatal: not a git repository"；所有 gh 调用都必须显式带 --repo。
+          REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
           shopt -s nullglob
-          files=(dist/*)
+
+          # 只收安装包类文件：artifact 里可能残留解包目录，gh 不接受目录参数。
+          files=()
+          for path in dist/*; do
+            [ -f "$path" ] || continue
+            name="$(basename "$path")"
+            case "$name" in
+              builder-debug.yml|builder-effective-config.yaml) continue ;;
+              *.exe|*.dmg|*.zip|*.blockmap|*.yml|*.yaml) files+=("$path") ;;
+            esac
+          done
           if [ "${#files[@]}" -eq 0 ]; then
-            echo '::error::没有下载到任何安装包产物'
+            echo '::error::没有可发布的安装包产物（dist/ 里没有 exe/dmg/zip 等安装包）'
             exit 1
           fi
+          printf '将发布 %d 个文件：\n' "${#files[@]}"
           printf '%s\n' "${files[@]}"
 
           # Release 的 tag 就是账本条目，detect 下次运行会读它；所以先删掉旧的再重建。
-          if gh release view "$LEDGER_TAG" >/dev/null 2>&1; then
-            gh release delete "$LEDGER_TAG" --yes --cleanup-tag
+          if gh release view "$LEDGER_TAG" --repo "$REPO" >/dev/null 2>&1; then
+            gh release delete "$LEDGER_TAG" --yes --cleanup-tag --repo "$REPO"
           fi
 
           prerelease=''
@@ -300,10 +321,11 @@ jobs:
             printf -- '- 安装包为**未签名**构建：Windows 会触发 SmartScreen 提示；macOS 首次打开需手动放行（`xattr -dr com.apple.quarantine "/Applications/DeepSeek Harness.app"`）。\n'
             printf -- '- 签名发行版需要 Windows EV 硬件令牌或 macOS Developer ID 证书，GitHub 托管 runner 无法提供。\n'
             printf -- '- 构建运行：[`%s`](https://github.com/%s/actions/runs/%s)\n' \
-              "$GITHUB_RUN_ID" "$GITHUB_REPOSITORY" "$GITHUB_RUN_ID"
+              "$GITHUB_RUN_ID" "$REPO" "$GITHUB_RUN_ID"
           } > notes.md
 
           gh release create "$LEDGER_TAG" "${files[@]}" \
+            --repo "$REPO" \
             --target "$GITHUB_SHA" \
             --title "DeepSeek Harness 桌面版 · ${TAG}" \
             --notes-file notes.md \
