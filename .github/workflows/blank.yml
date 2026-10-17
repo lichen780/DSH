@@ -124,7 +124,7 @@ jobs:
           retention-days: 30
 
   release:
-    name: 创建 GitHub 发布版
+    name: 创建 GitHub发布版
     needs: build
     runs-on: ubuntu-latest
     permissions:
