@@ -1,158 +1,257 @@
-name: 构建 DeepSeek Harness 桌面端（每日检测官方Tag版本）
+name: Desktop · upstream tag → installers
+
+# Upstream tag pushes never reach this repository, so the schedule is the trigger: detect reads the
+# upstream tag list and this repository's release ledger, then packages only the tags it has not
+# published yet. Everything below is idempotent — a failed run leaves the tag pending and the next
+# run retries it.
 
 on:
-  # UTC 0点，北京时间早上8点每日检测；想要北京时间0点则改为 cron: '0 16 * * *'
   schedule:
-    - cron: '0 0 * * *'
+    # Off the hour to avoid GitHub's congestion window; scheduled runs are best-effort, not exact.
+    - cron: '13,43 * * * *'
   workflow_dispatch:
     inputs:
-      ref:
-        description: 手动构建指定版本标签/分支/提交哈希，留空自动拉最新dsh-v开头Tag
-        default: ''
+      tag:
+        description: '上游 tag（如 dsh-v0.2.1-rc.1）。留空则自动挑选尚未打包的最新 tag'
         type: string
+        default: ''
+      targets:
+        description: '打包目标，逗号分隔：win-x64,mac-arm64,mac-x64'
+        type: string
+        default: 'win-x64'
+      allow_partial:
+        description: '允许部分目标失败也发布 release（不勾选时任一目标失败都不发布）'
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: desktop-upstream-tag
+  cancel-in-progress: false
 
 env:
   UPSTREAM_REPO: deepseek-ai/deepseek-harness
-  RECORD_FILE: .last-dsh-version-tag
+  UPSTREAM_TAG_PREFIX: dsh-v
+  PROCESSED_TAG_PREFIX: desktop-
+  MAX_TAGS_PER_RUN: '2'
+  # Never report to the production telemetry endpoint baked into apps/cli/cordis.yml.
+  DSH_TELEMETRY_DISABLED: '1'
+  DSH_DESKTOP_UPDATE_CHANNEL: nightly
 
 jobs:
-  check_upstream:
-    name: 检测上游最新Tag
+  detect:
+    name: Detect new upstream tags
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     outputs:
-      has_new_version: ${{ steps.compare.outputs.has_new_version }}
-      latest_tag: ${{ steps.get_latest_tag.outputs.latest_tag }}
+      has_work: ${{ steps.detect.outputs.has_work }}
+      matrix: ${{ steps.detect.outputs.matrix }}
+      tags: ${{ steps.detect.outputs.tags }}
     steps:
-      - name: 检出本仓库（读取上次记录版本）
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
 
-      - name: 获取官方仓库所有dsh-v开头Tag，取最新版本
-        id: get_latest_tag
+      - name: Resolve runner labels for the requested targets
         shell: bash
+        env:
+          TARGETS: ${{ inputs.targets || 'win-x64' }}
         run: |
-          set +eo pipefail
-          # 使用内置GITHUB_TOKEN认证调用API，提升访问限额，防限流403
-          RESP=$(curl -s -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" "https://api.github.com/repos/${{ env.UPSTREAM_REPO }}/tags")
-          # 提取所有tag名称，筛选 dsh-v 开头
-          ALL_TAGS=$(echo "$RESP" | jq -r '.[].name' || true)
-          V_TAGS=$(echo "$ALL_TAGS" | grep "^dsh-v" || true)
-          if [ -z "$V_TAGS" ]; then
-            LATEST_TAG=""
-          else
-            LATEST_TAG=$(echo "$V_TAGS" | sort -V | tail -n1)
-          fi
-          echo "latest_tag=$LATEST_TAG" >> $GITHUB_OUTPUT
-          echo "上游最新版本标签: $LATEST_TAG"
+          set -euo pipefail
+          entries=()
+          IFS=',' read -ra requested <<< "$TARGETS"
+          for raw in "${requested[@]}"; do
+            target="$(echo "$raw" | tr -d '[:space:]')"
+            [ -n "$target" ] || continue
+            case "$target" in
+              win-x64)   entries+=("\"win-x64\":\"windows-latest\"") ;;
+              mac-arm64) entries+=("\"mac-arm64\":\"macos-14\"") ;;
+              mac-x64)   entries+=("\"mac-x64\":\"macos-13\"") ;;
+              *) echo "::error::unknown target '$target' (expected win-x64, mac-arm64 or mac-x64)"; exit 1 ;;
+            esac
+          done
+          [ "${#entries[@]}" -gt 0 ] || { echo '::error::no targets selected'; exit 1; }
+          joined="$(IFS=,; echo "${entries[*]}")"
+          echo "TARGET_RUNNERS={$joined}" >> "$GITHUB_ENV"
+          echo "targets: {$joined}"
 
-      - name: 读取上次记录的版本标签
-        id: read_last
+      - name: Diff upstream tags against the release ledger
+        id: detect
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          FORCE_TAG: ${{ inputs.tag }}
+        run: node scripts/detect-upstream-tags.mjs
+
+  package:
+    name: Package ${{ matrix.tag }} · ${{ matrix.target }}
+    needs: detect
+    if: needs.detect.outputs.has_work == 'true'
+    strategy:
+      fail-fast: false
+      max-parallel: 3
+      matrix:
+        include: ${{ fromJSON(needs.detect.outputs.matrix) }}
+    runs-on: ${{ matrix.runsOn }}
+    timeout-minutes: 300
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          repository: ${{ env.UPSTREAM_REPO }}
+          ref: ${{ matrix.tag }}
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Verify the tag matches the product version
+        shell: bash
+        env:
+          EXPECTED_TAG: ${{ matrix.tag }}
         run: |
-          if [ -f ${{ env.RECORD_FILE }} ]; then
-            LAST_TAG=$(cat ${{ env.RECORD_FILE }})
-          else
-            LAST_TAG="none"
+          set -euo pipefail
+          version="$(node -p "require('./package.json').version")"
+          echo "tag=$EXPECTED_TAG package.json=$version"
+          # The packaging entry point rejects a mismatch later; fail here with a clear reason instead.
+          if [ "$EXPECTED_TAG" != "${UPSTREAM_TAG_PREFIX}${version}" ]; then
+            echo "::error::upstream tag $EXPECTED_TAG does not match package.json version $version"
+            exit 1
           fi
-          echo "last_tag=$LAST_TAG" >> $GITHUB_OUTPUT
-          echo "上次构建的版本标签: $LAST_TAG"
 
-      - name: 对比版本标签
-        id: compare
+      - uses: pnpm/action-setup@v6.1.0
+
+      - uses: actions/setup-node@v7.1.0
+        with:
+          node-version: '24'
+          cache: pnpm
+
+      - name: Install locked dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Reclaim disk space
+        # The macOS runner images ship developer runtimes this build never uses.
+        if: matrix.target != 'win-x64'
+        continue-on-error: true
         run: |
-          UPSTREAM_TAG=${{ steps.get_latest_tag.outputs.latest_tag }}
-          LAST_SAVED_TAG=${{ steps.read_last.outputs.last_tag }}
-          # 空tag代表获取失败，不触发打包
-          if [ -z "$UPSTREAM_TAG" ]; then
-            echo "has_new_version=false" >> $GITHUB_OUTPUT
-            echo "⏸️ 获取上游Tag失败，跳过本次构建"
-          elif [ "$UPSTREAM_TAG" != "$LAST_SAVED_TAG" ]; then
-            echo "has_new_version=true" >> $GITHUB_OUTPUT
-            echo "✅ 发现新版本Tag $UPSTREAM_TAG，准备打包"
-          else
-            echo "has_new_version=false" >> $GITHUB_OUTPUT
-            echo "⏸️ 上游没有新增Tag，直接终止流程"
-          fi
+          set -euo pipefail
+          df -h /
+          sudo rm -rf /Applications/Xcode*.app 2>/dev/null || true
+          sudo rm -rf ~/Library/Developer/CoreSimulator/Caches/* 2>/dev/null || true
+          df -h /
 
-  build:
-    name: ${{ matrix.platform }}
-    needs: check_upstream
-    if: needs.check_upstream.outputs.has_new_version == 'true'
-    runs-on: ${{ matrix.platform }}
+      - name: Write the Windows release configuration
+        # Windows packaging reads apps/desktop/.env.windows even when unsigned; macOS unsigned
+        # builds use built-in local defaults and need no file.
+        # The production deployment is the one that authenticates anonymously, so a self-built
+        # installer behaves like the official one instead of requiring upstream's test login.
+        if: matrix.target == 'win-x64'
+        shell: bash
+        env:
+          POLICY_ORIGIN: ${{ vars.DSH_POLICY_ORIGIN || 'https://download.deepseek.com' }}
+        run: |
+          set -euo pipefail
+          file=apps/desktop/.env.windows
+          {
+            printf 'DSH_DESKTOP_APP_ID=com.deepseek.harness\n'
+            printf 'DSH_DESKTOP_AUTO_UPDATE_ENV=production\n'
+            printf 'DSH_DESKTOP_MANDATORY_UPDATE_PROD_ORIGIN=%s\n' "$POLICY_ORIGIN"
+          } > "$file"
+          # Keys only; the values are deployment identifiers, not secrets.
+          cut -d= -f1 "$file"
+
+      - name: Check configuration and toolchain
+        run: |
+          set -euo pipefail
+          pnpm --dir apps/desktop run "${{ matrix.script }}" --check --build-version "${{ matrix.version }}"
+
+      - name: Build unsigned installers
+        run: |
+          set -euo pipefail
+          pnpm --dir apps/desktop run "${{ matrix.script }}" --build-version "${{ matrix.version }}"
+
+      - name: Upload installers
+        if: success()
+        uses: actions/upload-artifact@v7.0.2
+        with:
+          name: desktop-${{ matrix.tag }}-${{ matrix.target }}
+          # .desktop-build is a hidden directory, so hidden files must be included explicitly.
+          path: apps/desktop/.desktop-build/targets/${{ matrix.target }}/unsigned-artifacts/*
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Upload packaging diagnostics
+        if: always()
+        uses: actions/upload-artifact@v7.0.2
+        with:
+          name: desktop-logs-${{ matrix.tag }}-${{ matrix.target }}
+          path: apps/desktop/.desktop-build/packaging-runs/
+          include-hidden-files: true
+          if-no-files-found: ignore
+          retention-days: 7
+
+  publish:
+    name: Publish ${{ matrix.tag }}
+    needs: [detect, package]
+    # A partial matrix would publish an incomplete release and mark the tag as done, so a failed
+    # target blocks publication unless the run explicitly allows it.
+    if: >-
+      ${{
+        !cancelled()
+        && needs.detect.outputs.has_work == 'true'
+        && (needs.package.result == 'success' || inputs.allow_partial)
+      }}
     strategy:
       fail-fast: false
       matrix:
-        platform:
-          - windows-latest
-          - macos-14
-
-    steps:
-      - name: 检出上游源码（对应最新Tag）
-        uses: actions/checkout@v4
-        with:
-          repository: ${{ env.UPSTREAM_REPO }}
-          # 手动输入优先，否则自动使用检测到的最新tag
-          ref: ${{ github.event.inputs.ref || needs.check_upstream.outputs.latest_tag }}
-          fetch-depth: 0
-
-      - name: 安装 Node.js 22.19.0
-        uses: actions/setup-node@v4
-        with:
-          node-version: '22.19.0'
-
-      - name: 安装项目依赖（改为npm install，不需要package-lock.json）
-        working-directory: ./apps/desktop
-        run: npm install
-
-      # 单元测试已注释，避免测试失败阻断打包
-      # - name: 执行单元测试
-      #   working-directory: ./apps/desktop
-      #   run: npm test
-
-      - name: 构建并打包 Electron 程序
-        working-directory: ./apps/desktop
-        run: npm run dist -- --publish never
-
-      - name: 校验打包产物完整性
-        working-directory: ./apps/desktop
-        run: npm run verify:packaged
-
-      - name: 上传打包产物作为制品
-        uses: actions/upload-artifact@v4
-        with:
-          name: dsh桌面-${{ matrix.platform }}-${{ needs.check_upstream.outputs.latest_tag }}
-          path: apps/desktop/dist/
-          retention-days: 30
-
-  release:
-    name: 创建 GitHub 发布版
-    needs: build
+        tag: ${{ fromJSON(needs.detect.outputs.tags) }}
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     permissions:
       contents: write
     steps:
-      - name: 下载所有平台打包制品
-        uses: actions/download-artifact@v4
-
-      - name: 创建发布并上传安装包
-        uses: softprops/action-gh-release@v2
+      - uses: actions/download-artifact@v8.0.2
         with:
-          name: DeepSeek Harness 桌面构建 ${{ needs.check_upstream.outputs.latest_tag }}
-          body: >
-            自动构建，来源官方Tag版本：${{ needs.check_upstream.outputs.latest_tag }}
-            https://github.com/deepseek-ai/deepseek-harness/tree/${{ needs.check_upstream.outputs.latest_tag }}
-          generate_release_notes: false
+          pattern: desktop-${{ matrix.tag }}-*
+          path: dist
+          merge-multiple: true
 
-      - name: 更新版本标签记录文件
-        run: |
-          echo ${{ needs.check_upstream.outputs.latest_tag }} > ${{ env.RECORD_FILE }}
+      - name: Publish the release
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ matrix.tag }}
+          UPSTREAM: ${{ env.UPSTREAM_REPO }}
+          LEDGER_TAG: ${{ env.PROCESSED_TAG_PREFIX }}${{ matrix.tag }}
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          files=(dist/*)
+          if [ "${#files[@]}" -eq 0 ]; then
+            echo '::error::no installer artifacts were downloaded'
+            exit 1
+          fi
+          printf '%s\n' "${files[@]}"
 
-      - name: 提交并推送版本记录变更
-        run: |
-          git config --global user.name "github-actions[bot]"
-          git config --global user.email "github-actions[bot]@users.noreply.github.com"
-          git add ${{ env.RECORD_FILE }}
-          git commit -m "更新记录版本标签：${{ needs.check_upstream.outputs.latest_tag }}"
-          git push
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # The release tag is the ledger entry the detect job reads on the next run, so replace it.
+          if gh release view "$LEDGER_TAG" >/dev/null 2>&1; then
+            gh release delete "$LEDGER_TAG" --yes --cleanup-tag
+          fi
+
+          prerelease=''
+          case "$TAG" in *-*) prerelease='--prerelease' ;; esac
+
+          {
+            printf '由上游 tag [`%s`](https://github.com/%s/tree/%s) 自动构建。\n\n' "$TAG" "$UPSTREAM" "$TAG"
+            printf -- '- 安装包为**未签名**构建：Windows 会触发 SmartScreen 提示；macOS 首次打开需放行（`xattr -dr com.apple.quarantine "/Applications/DeepSeek Harness.app"`）。\n'
+            printf -- '- 签名发行版需要 Windows EV 硬件令牌或 macOS Developer ID 证书，GitHub 托管 runner 无法提供。\n'
+            printf -- '- 构建运行：[`%s`](https://github.com/%s/actions/runs/%s)\n' \
+              "$GITHUB_RUN_ID" "$GITHUB_REPOSITORY" "$GITHUB_RUN_ID"
+          } > notes.md
+
+          gh release create "$LEDGER_TAG" "${files[@]}" \
+            --target "$GITHUB_SHA" \
+            --title "DeepSeek Harness Desktop · ${TAG}" \
+            --notes-file notes.md \
+            $prerelease
