@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
     inputs:
       ref:
-        description: 手动构建指定版本标签/分支/提交哈希，留空自动拉最新v开头Tag
+        description: 手动构建指定版本标签/分支/提交哈希，留空自动拉最新dsh-v开头Tag
         default: ''
         type: string
 
@@ -26,16 +26,16 @@ jobs:
       - name: 检出本仓库（读取上次记录版本）
         uses: actions/checkout@v4
 
-      - name: 获取官方仓库所有v开头Tag，取最新版本
+      - name: 获取官方仓库所有dsh-v开头Tag，取最新版本
         id: get_latest_tag
         shell: bash
         run: |
           set +eo pipefail
           # 使用内置GITHUB_TOKEN认证调用API，提升访问限额，防限流403
           RESP=$(curl -s -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" "https://api.github.com/repos/${{ env.UPSTREAM_REPO }}/tags")
-          # 提取所有tag名称，筛选v开头
+          # 提取所有tag名称，筛选 dsh-v 开头
           ALL_TAGS=$(echo "$RESP" | jq -r '.[].name' || true)
-          V_TAGS=$(echo "$ALL_TAGS" | grep "^v" || true)
+          V_TAGS=$(echo "$ALL_TAGS" | grep "^dsh-v" || true)
           if [ -z "$V_TAGS" ]; then
             LATEST_TAG=""
           else
